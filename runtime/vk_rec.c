@@ -26,6 +26,7 @@ typedef struct {
     _Alignas(64) volatile uint64_t head; // words published by the producer; the recorder reads it
     _Alignas(64) volatile uint64_t tail; // words consumed by the recorder; the producer reads it
     _Alignas(64) volatile int32_t sleeping; // the recorder waits for wake_ev
+    PlatEvent wake_ev;                      // auto-reset
     _Alignas(64) uint64_t put_h;         // producer: words written (published up to head)
     VkCommandBuffer ring_cb;             // the recorder's copy of rec_cb, the command buffer its packets go into
     PlatThread *thread;
