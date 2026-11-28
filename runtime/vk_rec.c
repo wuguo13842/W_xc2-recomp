@@ -23,10 +23,10 @@
 // over the fields of that recorder.
 typedef struct {
     uint64_t *ring;
-    volatile uint64_t head, tail;        // words published by the producer / consumed by the recorder
-    volatile int32_t sleeping;           // the recorder waits for wake_ev
-    PlatEvent wake_ev;                   // auto-reset
-    uint64_t put_h;                      // producer: words written (published up to head)
+    _Alignas(64) volatile uint64_t head; // words published by the producer; the recorder reads it
+    _Alignas(64) volatile uint64_t tail; // words consumed by the recorder; the producer reads it
+    _Alignas(64) volatile int32_t sleeping; // the recorder waits for wake_ev
+    _Alignas(64) uint64_t put_h;         // producer: words written (published up to head)
     VkCommandBuffer ring_cb;             // the recorder's copy of rec_cb, the command buffer its packets go into
     PlatThread *thread;
     volatile int32_t part_open;          // 1 from rec_begin of a recorded part until its end (rec_end, rec_end_cb)
@@ -76,28 +76,52 @@ static uint64_t now_ns(void) { return plat_now_ns(); }
 
 static void exec_packet(uint32_t op, void *p);
 
-// How long the recorder spins on an empty ring before it sleeps on wake_ev, in pauses. A part that is open may publish
-// its next packet at any moment, and a sleep costs the scheduler's wake-up latency, so the spin stays long while a part
-// is open (XC2_REC_SPIN, default 4096). Between parts the recorder has nothing to wait for, and XC2_REC_SPIN_IDLE
-// (default 4096, as before) lowers the spin there: a 4096-pause spin is a fraction of a millisecond of a core.
+// How long the recorder polls an empty ring before it sleeps on wake_ev. A part that is open may publish its next
+// packet at any moment, and a sleep costs the scheduler's wake-up latency. By default the poll is timed: 60 us
+// (XC2_REC_SPIN_US), the same inside and between parts. With XC2_REC_SPIN_US=0, with fewer than 6 logical processors,
+// and in the A blocks of XC2_REC_SPIN_US=ab, it counts pauses instead: XC2_REC_SPIN (default 4096) while a part is
+// open, XC2_REC_SPIN_IDLE (default 4096) between parts, where the recorder has nothing to wait for; these two have no
+// effect while the timed poll applies.
 static int spin_open = 4096, spin_idle = 4096;
+static uint64_t rec_spin_ns;         // XC2_REC_SPIN_US (rec_main); 0: the pause-count spins above
+static int rec_spin_ab;              // XC2_REC_SPIN_US=ab: the timed poll in the B blocks of XC2_AB only
 
 static void spin_knobs(void) {
     const char *e = cfg_get("XC2_REC_SPIN");
     if (e && *e) spin_open = atoi(e);
     e = cfg_get("XC2_REC_SPIN_IDLE");
     if (e && *e) spin_idle = atoi(e);
+    // A pause takes 8-150 cycles depending on the CPU, so a pause count is not a time: poll for a fixed
+    // 60 us by default (XC2_REC_SPIN_US; 0 keeps the pause counts). With fewer than 6 logical processors
+    // the pauses stay: the recorder there is mostly asleep when a batch goes out (TotK Recomp vk_rec.c).
+    const char *sp = cfg_get("XC2_REC_SPIN_US");
+    rec_spin_ab = sp && !strcmp(sp, "ab");
+    int spin_us = sp && *sp && !rec_spin_ab ? atoi(sp) : 60;
+    rec_spin_ns = spin_us > 0 && plat_cpu_count() >= 6 ? (uint64_t)spin_us * 1000 : 0;
 }
 
 static void rec_main(void *arg) {
     rtls = arg ? arg : &rec0;   // the recorder this thread consumes for
     plat_thread_priority(rec_prio);
+    perf_core_thread(PCORE_RECORDER);
     uint64_t t = 0;
     for (;;) {
         uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            int spin = __atomic_load_n(&part_open, __ATOMIC_RELAXED) ? spin_open : spin_idle;
-            for (int i = 0; i < spin && t == h; i++) _mm_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            // Poll for the next packets before sleeping: a sleep costs the producer an event set and the
+            // recorder an OS wake-up. The poll is timed (XC2_REC_SPIN_US) because a pause takes 8-150
+            // cycles depending on the CPU: 4096 of them are ~140 us on a Coffee Lake i7, a few us on Zen 4.
+            if (rec_spin_ns && (!rec_spin_ab || rt_ab())) {
+                uint64_t t0 = now_ns();
+                for (unsigned i = 1; t == h; i++) {
+                    _mm_pause();
+                    h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+                    if (!(i & 31) && now_ns() - t0 >= rec_spin_ns) break;
+                }
+            } else {
+                int spin = __atomic_load_n(&part_open, __ATOMIC_RELAXED) ? spin_open : spin_idle;
+                for (int i = 0; i < spin && t == h; i++) _mm_pause(), h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);
+            }
             if (t == h) {
                 __atomic_store_n(&sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&head, __ATOMIC_SEQ_CST);
@@ -188,6 +212,9 @@ void rec_begin(VkCommandBuffer cb) {
             } else {
                 rt_log("vk_rec: the replay's Vulkan commands are made by a recorder thread%s",
                        rec_mode == 2 ? " in the B blocks (XC2_AB)" : "");
+                if (rec_spin_ns)
+                    rt_log("vk_rec: the recorder polls %llu us before it sleeps%s (XC2_REC_SPIN_US)",
+                           (unsigned long long)(rec_spin_ns / 1000), rec_spin_ab ? " in the B blocks" : "");
             }
         }
     }
